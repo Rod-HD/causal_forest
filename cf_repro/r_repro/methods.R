@@ -1,23 +1,28 @@
 # methods.R  -  Estimators using grf + FNN
 #
-# Causal Forest: grf::causal_forest()
-#   Design 1: tune.parameters="all", no honesty splitting override needed
-#   Design 2/3: default honest splitting (double-sample equivalent in grf)
+# Causal Forest (paper Section 6):
+#   Design 1: PROPENSITY FOREST (Procedure 2) — paper Section 6.1 requires this
+#             for the confounding setup. Emulated in grf 2.x by fitting
+#             regression_forest(X, W) for W.hat and passing it explicitly
+#             into causal_forest() (grf-labs recommended replacement for the
+#             deprecated propensity_forest()).
+#   Design 2/3: DOUBLE-SAMPLE TREES (Procedure 1) — default honest splitting
+#               in grf::causal_forest().
 #
 # k-NN: FNN::get.knnx()
-#   variance: (var(S1) + var(S0)) / (k*(k-1))   [paper Eq, p.19]
+#   Paper Eq. 26 (p.19):  V_hat = (V1 + V0) / (k*(k-1))   where V_w = sum of
+#   squared deviations. Since R's var() = V_w / (k-1), the formula simplifies
+#   to  (var(s1) + var(s0)) / k  — that is what we implement below.
 
 library(grf)
 library(FNN)
 
 # --------------------------------------------------------------------------
-# grow_causal_forest
-#   Wraps grf::causal_forest with paper hyperparameters.
-#   grf uses subsampling + honest splitting internally (IJ variance built-in).
+# grow_causal_forest  (Procedure 1 — Double-Sample Trees)
+#   Used for Design 2 and Design 3.
 #
-#   Design 1: n=500,   B=1000, s=50   => sample.fraction = 50/500  = 0.10
-#   Design 2: n=5000,  B=2000, s=2500 => sample.fraction = 2500/5000 = 0.50
-#   Design 3: n=10000, B=10000, s=2000 => sample.fraction = 2000/10000 = 0.20
+#   Design 2: n=5000,  B=2000,  s=2500 => sample.fraction = 0.50
+#   Design 3: n=10000, B=10000, s=2000 => sample.fraction = 0.20
 # --------------------------------------------------------------------------
 grow_causal_forest <- function(X_train, W_train, Y_train,
                                 num_trees, sample_fraction,
@@ -27,6 +32,51 @@ grow_causal_forest <- function(X_train, W_train, Y_train,
     X                = X_train,
     Y                = Y_train,
     W                = W_train,
+    num.trees        = num_trees,
+    sample.fraction  = sample_fraction,
+    min.node.size    = min_node_size,
+    honesty          = TRUE,
+    honesty.fraction = 0.5,
+    seed             = seed
+  )
+  cf
+}
+
+# --------------------------------------------------------------------------
+# grow_propensity_forest  (Procedure 2 — Propensity Forest)
+#   Used for Design 1 (confounding setup, paper Section 6.1).
+#
+#   grf >= 2.0 removed propensity_forest(). The grf-labs recommended
+#   replacement is to fit a regression_forest on (X, W) to obtain W.hat,
+#   then pass it explicitly to causal_forest(). This forces the causal
+#   forest to use the propensity estimate that the paper's Procedure 2
+#   embeds in its splitting target, instead of grf's internal OOB
+#   orthogonalization.
+#
+#   Y.hat is left at grf default (OOB residual-on-mean), which mirrors the
+#   paper's setup where m(x) is unknown and must be learned.
+#
+#   Design 1: n=500, B=1000, s=50 => sample.fraction = 0.10
+# --------------------------------------------------------------------------
+grow_propensity_forest <- function(X_train, W_train, Y_train,
+                                    num_trees, sample_fraction,
+                                    min_node_size = 1,
+                                    seed = NULL) {
+  forest_W <- regression_forest(
+    X               = X_train,
+    Y               = W_train,
+    num.trees       = num_trees,
+    sample.fraction = sample_fraction,
+    honesty         = TRUE,
+    seed            = seed
+  )
+  W_hat <- predict(forest_W)$predictions
+
+  cf <- causal_forest(
+    X                = X_train,
+    Y                = Y_train,
+    W                = W_train,
+    W.hat            = W_hat,
     num.trees        = num_trees,
     sample.fraction  = sample_fraction,
     min.node.size    = min_node_size,
@@ -51,7 +101,9 @@ predict_cf <- function(forest, X_test) {
 # --------------------------------------------------------------------------
 # predict_knn
 #   k-NN matching (paper Eq. 26).
-#   var_hat = (var(S1) + var(S0)) / (k*(k-1))
+#   Paper formula  V_hat = (V1+V0)/(k*(k-1))  with V_w = sum of squared
+#   deviations. Since R's var() = V_w/(k-1), the implementation collapses to
+#   (var(s1)+var(s0))/k.
 # --------------------------------------------------------------------------
 predict_knn <- function(X_train, W_train, Y_train, X_test, k) {
   idx0 <- which(W_train == 0)

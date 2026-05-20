@@ -51,10 +51,13 @@ run_one <- function(r) {
   te <- gen_fn(cfg$n_test, d, seed = seed_te)
 
   if (method == "cf") {
-    forest  <- grow_causal_forest(tr$X, tr$W, tr$Y,
-                                  num_trees       = cfg$num_trees,
-                                  sample_fraction = cfg$sample_fraction,
-                                  seed            = seed_tr)
+    # Design 1 = Propensity Forest (Procedure 2, paper Section 6.1).
+    # Design 2/3 = Double-Sample Trees (Procedure 1).
+    grow_fn <- if (design == 1L) grow_propensity_forest else grow_causal_forest
+    forest  <- grow_fn(tr$X, tr$W, tr$Y,
+                       num_trees       = cfg$num_trees,
+                       sample_fraction = cfg$sample_fraction,
+                       seed            = seed_tr)
     res <- predict_cf(forest, te$X)
   } else if (startsWith(method, "knn")) {
     k   <- as.integer(substring(method, 4))

@@ -1,20 +1,47 @@
 # Python virtual environment
 .venv/
 venv/
+env/
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # R session artifacts
 .Rhistory
 .RData
+.RDataTmp
+.Ruserdata
 .Rproj.user/
 *.Rproj
 
 # R temp files
 Rtmp*/
+*.Rout
+*.Rout.save
+*.Rlog
 
 # OS
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Local secrets/config
+.env
+.env.*
+!.env.example
+
+# Downloaded/intermediate real datasets
+cf_repro/results/real/*_raw.csv
+cf_repro/results/real/*_raw.csv.gz
+cf_repro/results/real/*_raw.rds
+cf_repro/results/real/*.rds
+
+# Runtime logs
+*.log
