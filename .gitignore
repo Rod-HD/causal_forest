@@ -43,5 +43,13 @@ cf_repro/results/real/*_raw.csv.gz
 cf_repro/results/real/*_raw.rds
 cf_repro/results/real/*.rds
 
+# Pre-trained demo models (regenerate via pretrain_demo.R)
+cf_repro/results/demo_pretrained/
+cf_repro/results/demo_exports/
+
+# Misc R artifacts
+cf_repro/r_repro/Rplots.pdf
+cf_repro/r_repro.zip
+
 # Runtime logs
 *.log
