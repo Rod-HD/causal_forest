@@ -149,8 +149,11 @@ ui <- fluidPage(
             div(class="tab-content",
               br(),
               fluidRow(
-                column(6, plotlyOutput("plot_mse",      height="340px")),
-                column(6, plotlyOutput("plot_coverage", height="340px"))
+                column(12, plotlyOutput("plot_mse", height="380px"))
+              ),
+              br(),
+              fluidRow(
+                column(12, plotlyOutput("plot_coverage", height="380px"))
               ),
               br(),
               div(style="font-size:12px; color:#888",
@@ -264,6 +267,8 @@ server <- function(input, output, session) {
       layout(legend = list(orientation="h", y=-0.3),
              margin = list(b=80))
   }
+
+
 
   output$plot_mse <- renderPlotly({
     df <- data_filtered()

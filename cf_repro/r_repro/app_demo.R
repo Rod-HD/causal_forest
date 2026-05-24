@@ -45,6 +45,7 @@ dir.create(EXPORT_DIR,   recursive = TRUE, showWarnings = FALSE)
 
 source(file.path(SD, "metrics.R"))
 source(file.path(SD, "learners.R"))
+source(file.path(SD, "dgp.R"))
 
 # ── Dataset registry ─────────────────────────────────────────────────────────
 
@@ -73,6 +74,39 @@ DATASETS <- list(
     outcomes = c(visit = "Visit (binary)", conversion = "Conversion (binary)"),
     max_n    = 100000L,
     desc     = "Criteo Uplift Modeling v2.1 (14M rows, 12 anonymised features). Subsampled to 100K for demo speed."
+  ),
+  design1 = list(
+    label     = "Simulation: Design 1 (Confounding — τ=0)",
+    has_group = FALSE,
+    is_sim    = TRUE,
+    sim_fn    = "gen_design1",
+    outcomes  = c(Y = "Outcome Y (continuous)"),
+    max_n     = 5000L,
+    d_vals    = c(2L, 5L, 10L, 20L),
+    default_d = 5L,
+    desc      = "Wager & Athey (2018) Design 1: tau(x)=0, e(x)=0.25×(1+Beta(2,4)(x₁)), m(x)=2x₁−1. Tests resistance to confounding bias."
+  ),
+  design2 = list(
+    label     = "Simulation: Design 2 (Smooth τ)",
+    has_group = FALSE,
+    is_sim    = TRUE,
+    sim_fn    = "gen_design2",
+    outcomes  = c(Y = "Outcome Y (continuous)"),
+    max_n     = 5000L,
+    d_vals    = c(2L, 3L, 4L, 5L, 6L, 8L),
+    default_d = 3L,
+    desc      = "Wager & Athey (2018) Design 2: tau(x)=sigma20(x₁)×sigma20(x₂), e(x)=0.5. Smooth heterogeneous treatment effects."
+  ),
+  design3 = list(
+    label     = "Simulation: Design 3 (Sharp τ)",
+    has_group = FALSE,
+    is_sim    = TRUE,
+    sim_fn    = "gen_design3",
+    outcomes  = c(Y = "Outcome Y (continuous)"),
+    max_n     = 5000L,
+    d_vals    = c(2L, 3L, 4L, 5L, 6L, 8L),
+    default_d = 3L,
+    desc      = "Wager & Athey (2018) Design 3: tau(x)=sigma12(x₁)×sigma12(x₂), e(x)=0.5. Sharp heterogeneous treatment effects."
   ),
   upload = list(
     label    = "Upload your own CSV",
@@ -200,13 +234,28 @@ prepare_xyw <- function(df, X_cols, W_col, Y_col, seed = 42L, max_n = NULL) {
 
 # Load dataset by registry key
 load_dataset <- function(ds_key, group = NULL, outcome = NULL,
-                          upload_df = NULL, upload_cols = NULL) {
+                          upload_df = NULL, upload_cols = NULL,
+                          sim_n = 5000L, sim_d = 5L) {
   if (ds_key == "upload") {
     if (is.null(upload_df) || is.null(upload_cols)) return(NULL)
     df <- upload_df
     list(df = df,
          X_cols = upload_cols$X, W_col = upload_cols$W, Y_col = upload_cols$Y,
          label = "Uploaded CSV", outcome_label = upload_cols$Y)
+  } else if (startsWith(ds_key, "design")) {
+    meta   <- DATASETS[[ds_key]]
+    gen_fn <- match.fun(meta$sim_fn)
+    dat    <- gen_fn(sim_n, sim_d, seed = 42L)
+    X_cols <- paste0("X", seq_len(sim_d))
+    df     <- as.data.frame(dat$X)
+    colnames(df) <- X_cols
+    df$W        <- dat$W
+    df$Y        <- dat$Y
+    df$.tau_true <- dat$tau
+    list(df = df, X_cols = X_cols, W_col = "W", Y_col = "Y",
+         label = meta$label,
+         outcome_label = sprintf("Y (simulated, d=%d)", sim_d),
+         has_tau_true = TRUE)
   } else {
     raw_path <- file.path(RAW_DIR, paste0(ds_key, "_raw.rds"))
     if (!file.exists(raw_path)) {
@@ -235,11 +284,31 @@ load_dataset <- function(ds_key, group = NULL, outcome = NULL,
 # Run full training pipeline for a dataset (or pre-trained list)
 build_results <- function(ds_key, group, outcome, num_trees,
                            upload_df = NULL, upload_cols = NULL,
-                           progress_fn = NULL) {
+                           progress_fn = NULL,
+                           sim_n = 5000L, sim_d = 5L) {
   meta <- DATASETS[[ds_key]]
-  loaded <- load_dataset(ds_key, group, outcome, upload_df, upload_cols)
+  loaded <- load_dataset(ds_key, group, outcome, upload_df, upload_cols,
+                         sim_n = sim_n, sim_d = sim_d)
   split  <- prepare_xyw(loaded$df, loaded$X_cols, loaded$W_col, loaded$Y_col,
                         seed = 42L, max_n = meta$max_n)
+
+  # For simulation datasets, extract tau_true aligned to test split
+  tau_true_test <- NULL
+  if (isTRUE(loaded$has_tau_true) && ".tau_true" %in% colnames(loaded$df)) {
+    df_sim <- loaded$df
+    if (!is.null(meta$max_n) && nrow(df_sim) > meta$max_n) {
+      set.seed(42L); df_sim <- df_sim[sample(nrow(df_sim), meta$max_n), ]
+    }
+    tau_vec <- df_sim$.tau_true
+    ok_idx  <- which(complete.cases(as.matrix(df_sim[, loaded$X_cols, drop=FALSE])) &
+                     !is.na(df_sim[[loaded$W_col]]) & !is.na(df_sim[[loaded$Y_col]]))
+    tau_vec <- tau_vec[ok_idx]
+    set.seed(42L)
+    n_ok    <- length(tau_vec)
+    tr_idx  <- sample(n_ok, floor(n_ok * 0.8))
+    te_idx  <- setdiff(seq_len(n_ok), tr_idx)
+    tau_true_test <- tau_vec[te_idx]
+  }
 
   learners <- train_all_learners(
     X_train = split$X_train, W_train = split$W_train, Y_train = split$Y_train,
@@ -288,6 +357,9 @@ build_results <- function(ds_key, group, outcome, num_trees,
     metrics       = metrics_df,
     var_importance = vi_df,
     is_binary_Y   = .is_binary_outcome(split$Y_test),
+    tau_true      = tau_true_test,
+    is_sim        = isTRUE(DATASETS[[ds_key]]$is_sim),
+    sim_d         = if (isTRUE(DATASETS[[ds_key]]$is_sim)) sim_d else NULL,
     trained_at    = Sys.time(),
     mode          = "fresh",
     num_trees     = num_trees
@@ -390,6 +462,11 @@ ui <- fluidPage(
             uiOutput("upload_col_selectors")
           ),
 
+          conditionalPanel(
+            "input.dataset == 'design1' || input.dataset == 'design2' || input.dataset == 'design3'",
+            uiOutput("sim_d_ui")
+          ),
+
           div(class="desc-box", textOutput("dataset_desc"))
         ),
 
@@ -449,7 +526,7 @@ server <- function(input, output, session) {
 
   output$outcome_selector <- renderUI({
     ds <- input$dataset
-    if (ds == "upload") return(NULL)
+    if (ds %in% c("upload", "design1", "design2", "design3")) return(NULL)
     out <- DATASETS[[ds]]$outcomes
     if (is.null(out)) return(NULL)
     choices_vec <- setNames(names(out), unname(out))
@@ -457,24 +534,42 @@ server <- function(input, output, session) {
                 selected = names(out)[1], width = "100%")
   })
 
+  output$sim_d_ui <- renderUI({
+    ds <- input$dataset
+    if (!startsWith(ds, "design")) return(NULL)
+    d_vals <- DATASETS[[ds]]$d_vals
+    radioButtons("sim_d", "Dimension d (# features):",
+                 choices  = setNames(d_vals, paste0("d=", d_vals)),
+                 selected = DATASETS[[ds]]$default_d,
+                 inline   = TRUE)
+  })
+
   output$dataset_desc <- renderText({ DATASETS[[input$dataset]]$desc %||% "" })
 
   output$eta_display <- renderUI({
+    ds <- input$dataset
+    if (startsWith(ds, "design")) return(NULL)
     nt <- input$num_trees %||% 500
-    n_train <- if (input$dataset == "hillstrom") 34000L else 80000L
-    est <- round((n_train / 10000) * (nt / 500) * 20)  # 6 learners total
+    n_train <- if (ds == "hillstrom") 34000L else 80000L
+    est <- round((n_train / 10000) * (nt / 500) * 20)
     div(style="font-size:12px; color:#888; margin-top:-6px; margin-bottom:6px",
         sprintf("Est. full train: ~%ds (all 6 learners)", est))
   })
 
   output$train_btn_ui <- renderUI({
+    ds  <- input$dataset
     res <- results_rv()
-    label <- if (is.null(res) || isTRUE(res$mode == "pretrained")) {
-      "▶ Re-train with current settings"
+    if (startsWith(ds, "design")) {
+      div(style="font-size:12px; color:#666; font-style:italic; padding:4px 0",
+          "Pre-trained — loads instantly on selection.")
     } else {
-      "↻ Re-train"
+      label <- if (is.null(res) || isTRUE(res$mode == "pretrained")) {
+        "▶ Re-train with current settings"
+      } else {
+        "↻ Re-train"
+      }
+      actionButton("train_btn", label, class = "btn run-btn")
     }
-    actionButton("train_btn", label, class = "btn run-btn")
   })
 
   output$learner_status <- renderUI({
@@ -526,6 +621,9 @@ server <- function(input, output, session) {
     key <- if (ds == "hillstrom") {
       pretrain_key("hillstrom", input$hillstrom_group %||% "men",
                    input$outcome %||% "visit")
+    } else if (startsWith(ds, "design")) {
+      d <- as.integer(input$sim_d %||% DATASETS[[ds]]$default_d)
+      sprintf("%s_d%d", ds, d)
     } else {
       pretrain_key(ds, NULL, input$outcome %||% "visit")
     }
@@ -555,6 +653,15 @@ server <- function(input, output, session) {
       }
     } else if (!file.exists(path)) {
       last_loaded_key(NULL)
+      # Design selected but no pretrained file — show hint
+      if (startsWith(input$dataset, "design")) {
+        showNotification(
+          tags$span(tags$b("Pre-trained file not found"), tags$br(),
+                    tags$code(basename(path)), tags$br(),
+                    "Run: ", tags$code("Rscript pretrain_demo.R --all-sim")),
+          duration = 8, type = "warning"
+        )
+      }
     }
   })
 
@@ -603,7 +710,7 @@ server <- function(input, output, session) {
 
     res <- tryCatch(
       build_results(ds, group, outcome, nt, upload_df, upload_cols,
-                    progress_fn = NULL),  # disable per-step notif to keep simple
+                    progress_fn = NULL),
       error = function(e) {
         removeNotification(notif_id)
         showNotification(paste("Training failed:", conditionMessage(e)),
@@ -712,7 +819,13 @@ server <- function(input, output, session) {
           div(class="card",
             h4(sprintf("Outcome distribution by W (%s)", res$outcome_label)),
             plotlyOutput("plot_y_by_w", height = "280px")
-          )
+          ),
+          if (isTRUE(res$is_sim) && !is.null(res$tau_true)) {
+            div(class="card",
+              h4(sprintf("True τ(x) distribution (d=%d)", res$sim_d %||% "?")),
+              plotlyOutput("plot_tau_true", height = "220px")
+            )
+          }
         )
       )
     )
@@ -778,6 +891,24 @@ server <- function(input, output, session) {
     }
   })
 
+  output$plot_tau_true <- renderPlotly({
+    res <- results_rv()
+    req(!is.null(res), isTRUE(res$is_sim), !is.null(res$tau_true))
+    df <- data.frame(tau = res$tau_true)
+    p <- ggplot(df, aes(x = tau)) +
+      geom_density(fill = "#9b59b6", alpha = 0.5, color = "white", linewidth = 0.4) +
+      geom_vline(xintercept = mean(res$tau_true), linetype = "dashed",
+                 color = "#e74c3c", linewidth = 0.9) +
+      geom_vline(xintercept = 0, linetype = "dotted", color = "#888", linewidth = 0.6) +
+      labs(x = "True τ(x)", y = "Density") +
+      theme_bw(base_size = 11) +
+      theme(panel.grid.minor = element_blank())
+    ggplotly(p) %>%
+      style_plotly(title = sprintf("True τ: mean=%.3f, sd=%.3f",
+                                   mean(res$tau_true), sd(res$tau_true)),
+                   legend_pos = "none", margin_t = 50, margin_b = 50)
+  })
+
   # ─────────────────────────────────────────────────────────────────────────
   # TAB 2 — Quantitative Comparison
   # ─────────────────────────────────────────────────────────────────────────
@@ -809,12 +940,23 @@ server <- function(input, output, session) {
       Train  = sprintf("%.1fs", df$train_time),
       stringsAsFactors = FALSE
     )
-    colnames(out) <- c("Method", "AUUC \u2191", "Qini \u2191", "AUC (Y)", "Train")
-    cf_row <- which(out$Method == "Causal Forest")
+    if (isTRUE(res$is_sim) && !is.null(res$tau_true)) {
+      rmse_vals <- sapply(LEARNER_ORDER, function(nm) {
+        lr <- res$learners[[nm]]
+        if (!isTRUE(lr$ok) || is.null(lr$pred$tau_hat)) return(NA_real_)
+        sqrt(mean((lr$pred$tau_hat - res$tau_true) ^ 2))
+      })
+      out$RMSE <- ifelse(is.na(rmse_vals), "\u2014", sprintf("%.4f", rmse_vals))
+      colnames(out) <- c("Method", "AUUC \u2191", "Qini \u2191", "AUC (Y)", "Train", "RMSE vs \u03c4(x) \u2193")
+    } else {
+      colnames(out) <- c("Method", "AUUC \u2191", "Qini \u2191", "AUC (Y)", "Train")
+    }
+    n_metric_cols <- ncol(out) - 1
+    cf_row <- which(out[["Method"]] == "Causal Forest")
     DT::datatable(out, rownames = FALSE, selection = "none",
                   options = list(dom = 't', pageLength = 10, ordering = FALSE,
                                  columnDefs = list(
-                                   list(className = 'dt-center', targets = 1:4)))) %>%
+                                   list(className = 'dt-center', targets = seq_len(n_metric_cols))))) %>%
       DT::formatStyle("Method",
         target = "row",
         fontWeight = DT::styleEqual("Causal Forest", "bold"),
@@ -857,8 +999,23 @@ server <- function(input, output, session) {
     tagList(
       fluidRow(
         column(8,
-          checkboxGroupInput("curve_methods", "Show methods:",
-            choices = unname(valid), selected = unname(valid), inline = TRUE),
+          fluidRow(
+            column(6,
+              checkboxGroupInput("curve_methods", "Show methods:",
+                choices = unname(valid), selected = unname(valid), inline = TRUE)
+            ),
+            column(3,
+              checkboxInput("curve_smooth", "Smooth lines", value = FALSE),
+              tags$div(style="font-size:11px; color:#888; margin-top:-4px",
+                       "Reduces noise to see trends")
+            ),
+            column(3,
+              sliderInput("curve_zoom", "Zoom X range (%):",
+                min = 0, max = 100, value = c(0, 100), step = 5, width = "100%"),
+              tags$div(style="font-size:11px; color:#888; margin-top:-4px",
+                       "Drag either handle to zoom")
+            )
+          ),
           plotlyOutput("plot_uplift_curve", height = "400px"),
           br(),
           plotlyOutput("plot_qini_curve", height = "400px")
@@ -896,16 +1053,28 @@ server <- function(input, output, session) {
 
   output$plot_uplift_curve <- renderPlotly({
     df_all <- uplift_data_all(); req(!is.null(df_all))
-    sel <- input$curve_methods %||% unique(df_all$method)
-    df <- df_all[df_all$method %in% sel, ]
+    sel    <- input$curve_methods %||% unique(df_all$method)
+    zoom_range <- (input$curve_zoom %||% c(0, 100)) / 100
+    zoom_lo <- zoom_range[1]; zoom_hi <- zoom_range[2]
+    smooth <- isTRUE(input$curve_smooth)
+    df <- df_all[df_all$method %in% sel &
+                 df_all$pct_targeted >= zoom_lo &
+                 df_all$pct_targeted <= zoom_hi, ]
     if (nrow(df) == 0) return(plotly_empty())
     df <- df[order(df$method, df$pct_targeted), ]
-    rand_df <- df_all %>% group_by(pct_targeted) %>%
-      summarise(random = mean(random), .groups = "drop")
+    rand_df <- df_all[df_all$pct_targeted >= zoom_lo &
+                      df_all$pct_targeted <= zoom_hi, ] %>%
+      group_by(pct_targeted) %>% summarise(random = mean(random), .groups = "drop")
 
     p <- ggplot(df, aes(x = pct_targeted, y = cum_gain,
-                        color = method, group = method)) +
-      geom_line(linewidth = 1.1) +
+                        color = method, group = method))
+    if (smooth) {
+      p <- p + geom_smooth(se = FALSE, linewidth = 1.1, span = 0.3, method = "loess",
+                           formula = y ~ x)
+    } else {
+      p <- p + geom_line(linewidth = 1.1)
+    }
+    p <- p +
       geom_line(data = rand_df, aes(x = pct_targeted, y = random),
                 color = "#999999", linetype = "dashed", linewidth = 0.7,
                 inherit.aes = FALSE) +
@@ -913,12 +1082,11 @@ server <- function(input, output, session) {
       scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
       labs(x = "% Population targeted", y = "Cumulative uplift gain") +
       theme_bw(base_size = 12) +
-      theme(legend.position = "none",
-            panel.grid.minor = element_blank())
+      theme(legend.position = "bottom", panel.grid.minor = element_blank())
     ggplotly(p, tooltip = c("colour", "x", "y")) %>%
       style_plotly(title = "Uplift Curve  (gray dashed = Random baseline)",
-                   legend_pos = "bottom",
-                   margin_t = 60, margin_b = 110, margin_l = 70, margin_r = 30)
+                   legend_pos = "right",
+                   margin_t = 60, margin_b = 60, margin_l = 70, margin_r = 140)
   })
 
   qini_data_all <- reactive({
@@ -939,16 +1107,28 @@ server <- function(input, output, session) {
 
   output$plot_qini_curve <- renderPlotly({
     df_all <- qini_data_all(); req(!is.null(df_all))
-    sel <- input$curve_methods %||% unique(df_all$method)
-    df <- df_all[df_all$method %in% sel, ]
+    sel    <- input$curve_methods %||% unique(df_all$method)
+    zoom_range <- (input$curve_zoom %||% c(0, 100)) / 100
+    zoom_lo <- zoom_range[1]; zoom_hi <- zoom_range[2]
+    smooth <- isTRUE(input$curve_smooth)
+    df <- df_all[df_all$method %in% sel &
+                 df_all$pct_targeted >= zoom_lo &
+                 df_all$pct_targeted <= zoom_hi, ]
     if (nrow(df) == 0) return(plotly_empty())
     df <- df[order(df$method, df$pct_targeted), ]
-    rand_df <- df_all %>% group_by(pct_targeted) %>%
-      summarise(random = mean(random), .groups = "drop")
+    rand_df <- df_all[df_all$pct_targeted >= zoom_lo &
+                      df_all$pct_targeted <= zoom_hi, ] %>%
+      group_by(pct_targeted) %>% summarise(random = mean(random), .groups = "drop")
 
     p <- ggplot(df, aes(x = pct_targeted, y = qini_gain,
-                        color = method, group = method)) +
-      geom_line(linewidth = 1.1) +
+                        color = method, group = method))
+    if (smooth) {
+      p <- p + geom_smooth(se = FALSE, linewidth = 1.1, span = 0.3, method = "loess",
+                           formula = y ~ x)
+    } else {
+      p <- p + geom_line(linewidth = 1.1)
+    }
+    p <- p +
       geom_line(data = rand_df, aes(x = pct_targeted, y = random),
                 color = "#999999", linetype = "dashed", linewidth = 0.7,
                 inherit.aes = FALSE) +
@@ -956,12 +1136,11 @@ server <- function(input, output, session) {
       scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
       labs(x = "% Population targeted", y = "Qini gain") +
       theme_bw(base_size = 12) +
-      theme(legend.position = "none",
-            panel.grid.minor = element_blank())
+      theme(legend.position = "bottom", panel.grid.minor = element_blank())
     ggplotly(p, tooltip = c("colour", "x", "y")) %>%
       style_plotly(title = "Qini Curve  (gray dashed = Random baseline)",
-                   legend_pos = "bottom",
-                   margin_t = 60, margin_b = 110, margin_l = 70, margin_r = 30)
+                   legend_pos = "right",
+                   margin_t = 60, margin_b = 60, margin_l = 70, margin_r = 140)
   })
 
   output$key_observations <- renderUI({
@@ -1181,7 +1360,7 @@ server <- function(input, output, session) {
 
     tau_class <- if (tau > 0) "pos-tau" else if (tau < 0) "neg-tau" else ""
     decision_class <- if (treat) "decision-treat" else "decision-no"
-    decision_text  <- if (treat) "✅ TREAT" else "\U0001F6AB DO NOT TREAT"
+    decision_text  <- if (treat) "TREAT" else "DO NOT TREAT"
 
     tagList(
       tags$div(style="text-align:center; color:#666; font-size:13px; text-transform:uppercase; letter-spacing:1px",
