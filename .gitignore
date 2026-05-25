@@ -32,6 +32,12 @@ desktop.ini
 .vscode/
 .idea/
 
+# Kiro spec files
+.kiro/
+
+# Claude Code memory
+.claude/
+
 # Local secrets/config
 .env
 .env.*
